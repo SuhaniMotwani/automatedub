@@ -18,3 +18,5 @@
 # Antigravity will add entries here as each module is scaffolded.
 yt-dlp>=2025.1.15
 faster-whisper>=1.2.0
+edge-tts>=7.0.0
+librosa>=0.10.0
