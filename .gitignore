@@ -6,3 +6,45 @@ samples/output/
 .env
 ffmpeg-bin/
 samples/input/
+
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# ffmpeg local binary
+ffmpeg-bin/
+
+# Secrets / tokens
+.env
+*.token
+
+# Video/audio — source, intermediate, and output
+*.wav
+*.mp3
+*.mp4
+*.mkv
+samples/input/
+samples/output/
+temp/
+tmp/
+segments/
+
+# Downloaded/cached model weights (Whisper, XTTS, HuggingFace models)
+*.pt
+*.bin
+*.ckpt
+models/
+checkpoints/
+.cache/
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor/IDE settings
+.vscode/
+.idea/
