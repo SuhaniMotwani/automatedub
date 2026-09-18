@@ -48,3 +48,26 @@ Thumbs.db
 # Editor/IDE settings
 .vscode/
 .idea/
+
+# Frontend (Node/React)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Backend
+backend/__pycache__/
+backend/*.pyc
+
+scratch/
+
+# Frontend (Node/React)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Backend
+backend/__pycache__/
+backend/*.pyc
+
+# Scratch/debug files
+scratch/
