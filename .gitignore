@@ -5,3 +5,4 @@ __pycache__/
 samples/output/
 .env
 ffmpeg-bin/
+samples/input/
