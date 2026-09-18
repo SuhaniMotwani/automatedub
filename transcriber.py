@@ -5,9 +5,12 @@ Uses faster-whisper (CTranslate2-backed Whisper) for high-performance,
 low-latency speech transcription and translation.
 """
 
+import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _setup_cuda_env() -> None:
@@ -107,7 +110,9 @@ def transcribe(audio_path: str, model_size: str = "medium") -> List[Dict[str, An
                     "end": float,          # End time in seconds
                     "text": str,           # Original or transcribed segment text
                     "english_text": str,   # Translated English text
-                    "lang": str            # Detected source language code (e.g. 'en', 'fr', 'hi')
+                    "lang": str,           # Detected source language code (e.g. 'en', 'fr', 'hi')
+                    "word_starts": list,   # Word-level timestamp dicts [{"word": str, "start": float, "end": float, ...}]
+                    "words": list          # Word-level timestamp dicts
                 },
                 ...
             ]
@@ -130,12 +135,21 @@ def transcribe(audio_path: str, model_size: str = "medium") -> List[Dict[str, An
 
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
+    # Moderate VAD parameters: robust against background music while preventing over-merging
+    active_vad_params = {
+        "threshold": 0.6,
+        "min_silence_duration_ms": 500,
+        "speech_pad_ms": 400,
+    }
+
     print(f"[transcribe] Processing audio: {audio_path}...", flush=True)
     segments_gen, info = model.transcribe(
         audio_path,
         task="translate",
         beam_size=5,
         vad_filter=True,
+        vad_parameters=active_vad_params,
+        word_timestamps=True,
     )
 
     detected_lang = info.language
@@ -152,21 +166,88 @@ def transcribe(audio_path: str, model_size: str = "medium") -> List[Dict[str, An
         if not text_content:
             continue
 
-        start_time = round(float(seg.start), 3)
-        end_time = round(float(seg.end), 3)
+        words_list: List[Dict[str, Any]] = []
+        if getattr(seg, "words", None):
+            for w in seg.words:
+                w_text = w.word.strip()
+                if not w_text:
+                    continue
+                words_list.append({
+                    "word": w_text,
+                    "start": round(float(w.start), 3),
+                    "end": round(float(w.end), 3),
+                    "probability": round(float(w.probability), 3),
+                })
 
-        segment_dict = {
-            "start": start_time,
-            "end": end_time,
-            "text": text_content,
-            "english_text": text_content,
-            "lang": detected_lang,
-        }
-        results.append(segment_dict)
+        # Restructure segments: split on intra-segment word gaps (> 2.0s) for granular boundaries
+        word_groups: List[List[Dict[str, Any]]] = []
+        current_group: List[Dict[str, Any]] = []
+        if words_list:
+            for w in words_list:
+                if current_group and (w["start"] - current_group[-1]["end"] > 2.0):
+                    word_groups.append(current_group)
+                    current_group = [w]
+                else:
+                    current_group.append(w)
+            if current_group:
+                word_groups.append(current_group)
 
-        start_ts = _format_timestamp(start_time)
-        end_ts = _format_timestamp(end_time)
-        print(f"[transcribe] {start_ts} -> {end_ts}: {text_content}", flush=True)
+        if word_groups:
+            for group in word_groups:
+                grp_start = group[0]["start"]
+                grp_end = group[-1]["end"]
+                grp_dur = round(grp_end - grp_start, 2)
+                grp_text = text_content if len(word_groups) == 1 else " ".join(w["word"] for w in group)
+
+                segment_dict = {
+                    "start": grp_start,
+                    "end": grp_end,
+                    "text": grp_text,
+                    "english_text": grp_text,
+                    "lang": detected_lang,
+                    "word_starts": group,
+                    "words": group,
+                }
+                results.append(segment_dict)
+
+                start_ts = _format_timestamp(grp_start)
+                end_ts = _format_timestamp(grp_end)
+                print(f"[transcribe] {start_ts} -> {end_ts} (duration: {grp_dur:.2f}s): {grp_text}", flush=True)
+
+                if grp_dur > 15.0:
+                    warn_msg = (
+                        f"[transcribe] Warning: segment duration ({grp_dur:.2f}s) exceeds 15 seconds "
+                        f"threshold ({start_ts} -> {end_ts})"
+                    )
+                    logger.warning(warn_msg)
+                    print(warn_msg, flush=True)
+        else:
+            start_time = round(float(seg.start), 3)
+            end_time = round(float(seg.end), 3)
+            seg_dur = round(end_time - start_time, 2)
+
+            segment_dict = {
+                "start": start_time,
+                "end": end_time,
+                "text": text_content,
+                "english_text": text_content,
+                "lang": detected_lang,
+                "word_starts": [],
+                "words": [],
+            }
+            results.append(segment_dict)
+
+            start_ts = _format_timestamp(start_time)
+            end_ts = _format_timestamp(end_time)
+            print(f"[transcribe] {start_ts} -> {end_ts} (duration: {seg_dur:.2f}s): {text_content}", flush=True)
+
+            if seg_dur > 15.0:
+                warn_msg = (
+                    f"[transcribe] Warning: segment duration ({seg_dur:.2f}s) exceeds 15 seconds "
+                    f"threshold ({start_ts} -> {end_ts})"
+                )
+                logger.warning(warn_msg)
+                print(warn_msg, flush=True)
 
     print(f"[transcribe] Transcription complete. Generated {len(results)} segments.", flush=True)
     return results
