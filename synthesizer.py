@@ -8,6 +8,7 @@ without robotic pitch distortion using ffmpeg's atempo filter, silence padding, 
 
 import asyncio
 import concurrent.futures
+import logging
 import os
 import shutil
 import subprocess
@@ -19,10 +20,56 @@ import edge_tts
 import librosa
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 # Curated natural edge-tts voices per gender
 VOICE_MALE = "en-US-ChristopherNeural"
 VOICE_FEMALE = "en-US-JennyNeural"
 VOICE_DEFAULT = "en-US-AriaNeural"
+
+
+def _trim_trailing_silence(audio_path: str, threshold: int = 150) -> float:
+    """
+    Safely trims trailing digital silence from a 16-bit PCM mono WAV file without cutting speech.
+    Modifies the file in place and returns the new duration in seconds.
+    """
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        return 0.0
+
+    try:
+        with wave.open(audio_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            frames = wf.readframes(n_frames)
+
+        if n_channels != 1 or sampwidth != 2 or n_frames == 0:
+            return _get_audio_duration(audio_path)
+
+        samples = np.frombuffer(frames, dtype=np.int16)
+        active_indices = np.where(np.abs(samples) > threshold)[0]
+        if len(active_indices) == 0:
+            return len(samples) / framerate
+
+        last_active_idx = active_indices[-1]
+        # Keep a subtle 50ms safety buffer after last active sample to prevent abrupt cutoffs
+        pad_samples = int(round(0.05 * framerate))
+        keep_samples = min(len(samples), last_active_idx + 1 + pad_samples)
+
+        # Only modify file if more than 50ms of trailing silence can be removed
+        if keep_samples < len(samples) - pad_samples:
+            trimmed_samples = samples[:keep_samples]
+            with wave.open(audio_path, "wb") as wf:
+                wf.setnchannels(n_channels)
+                wf.setsampwidth(sampwidth)
+                wf.setframerate(framerate)
+                wf.writeframes(trimmed_samples.tobytes())
+            return len(trimmed_samples) / framerate
+
+        return len(samples) / framerate
+    except Exception:
+        return _get_audio_duration(audio_path)
 
 
 def _get_audio_duration(file_path: str) -> float:
@@ -378,10 +425,11 @@ def synthesize_segments(
                 continue
 
             mismatch = abs(actual_duration - target_duration)
+            raw_duration = actual_duration
 
-            # 3. Duration Adjustment Logic
+            # 3. Duration Adjustment Logic (Never cut speech; only pad/trim silence and stretch within +/-15%)
             if mismatch <= 1.0:
-                # Small mismatch (<= 1s): DO NOT stretch. Pad with silence or trim instead.
+                # Small mismatch (<= 1s): DO NOT stretch.
                 if actual_duration <= target_duration:
                     # Pad trailing silence up to target_duration
                     subprocess.run(
@@ -407,32 +455,43 @@ def synthesize_segments(
                     )
                     status_note = f"padded {target_duration - actual_duration:.2f}s silence (no stretch)"
                 else:
-                    # Speech is slightly longer (<= 1s): trim end with subtle 0.05s fade-out
-                    fade_start = max(0.0, target_duration - 0.05)
-                    subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            temp_wav,
-                            "-af",
-                            f"afade=t=out:st={fade_start:.3f}:d=0.05",
-                            "-t",
-                            f"{target_duration:.3f}",
-                            "-vn",
-                            "-acodec",
-                            "pcm_s16le",
-                            "-ar",
-                            "24000",
-                            "-ac",
-                            "1",
-                            final_wav_path,
-                        ],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                    )
-                    status_note = f"trimmed {actual_duration - target_duration:.2f}s (no stretch)"
+                    # Speech is slightly longer: only trim silence, NEVER cut speech!
+                    trimmed_dur = _trim_trailing_silence(temp_wav)
+                    if trimmed_dur <= target_duration:
+                        # After trimming trailing silence it now fits; pad to target_duration
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                temp_wav,
+                                "-af",
+                                f"apad=whole_dur={target_duration:.3f}",
+                                "-vn",
+                                "-acodec",
+                                "pcm_s16le",
+                                "-ar",
+                                "24000",
+                                "-ac",
+                                "1",
+                                final_wav_path,
+                            ],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        status_note = f"trimmed trailing silence to {trimmed_dur:.2f}s and padded to target"
+                    else:
+                        # Full audio is speech: KEEP FULL AUDIO, DO NOT CUT WORDS!
+                        shutil.copyfile(temp_wav, final_wav_path)
+                        overflow = trimmed_dur - target_duration
+                        warn_msg = (
+                            f"[synthesize] Warning: Segment {idx + 1} will run long / overlap with next segment's start "
+                            f"(duration: {trimmed_dur:.2f}s exceeds target: {target_duration:.2f}s by {overflow:.2f}s). "
+                            f"Keeping full audio to prevent dropping words."
+                        )
+                        print(warn_msg, flush=True)
+                        status_note = f"kept full audio (runs long by {overflow:.2f}s, no stretch)"
             else:
                 # Significant mismatch (> 1.0s): apply pitch-preserving atempo time-stretching
                 speed_factor = actual_duration / target_duration
@@ -440,20 +499,20 @@ def synthesize_segments(
 
                 # Cap stretching strictly at +/-15% (0.85x to 1.15x) for naturalness
                 if speed_factor > 1.15:
-                    print(
+                    warn_factor = (
                         f"[synthesize] Warning: Segment {idx + 1} speed-up exceeds +15% "
                         f"(target: {target_duration:.2f}s, generated: {actual_duration:.2f}s, "
-                        f"factor: {speed_factor:.2f}x). Clamping to 1.15x to preserve natural speech.",
-                        flush=True,
+                        f"factor: {speed_factor:.2f}x). Clamping to 1.15x to preserve natural speech."
                     )
+                    print(warn_factor, flush=True)
                     clamped_factor = 1.15
                 elif speed_factor < 0.85:
-                    print(
+                    warn_factor = (
                         f"[synthesize] Warning: Segment {idx + 1} slow-down exceeds -15% "
                         f"(target: {target_duration:.2f}s, generated: {actual_duration:.2f}s, "
-                        f"factor: {speed_factor:.2f}x). Clamping to 0.85x to preserve natural speech.",
-                        flush=True,
+                        f"factor: {speed_factor:.2f}x). Clamping to 0.85x to preserve natural speech."
                     )
+                    print(warn_factor, flush=True)
                     clamped_factor = 0.85
 
                 stretched_wav = os.path.join(temp_dir, f"stretched_{idx:04d}.wav")
@@ -479,9 +538,9 @@ def synthesize_segments(
                     stderr=subprocess.PIPE,
                 )
 
-                # Post-stretch alignment with pad/trim
+                # Post-stretch alignment: only pad silence, NEVER cut speech!
                 stretched_dur = _get_audio_duration(stretched_wav)
-                if stretched_dur < target_duration:
+                if stretched_dur <= target_duration:
                     subprocess.run(
                         [
                             "ffmpeg",
@@ -503,41 +562,51 @@ def synthesize_segments(
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
                     )
+                    status_note = f"atempo stretched ({clamped_factor:.2f}x) + padded {target_duration - stretched_dur:.2f}s"
                 else:
-                    fade_start = max(0.0, target_duration - 0.05)
-                    subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            stretched_wav,
-                            "-af",
-                            f"afade=t=out:st={fade_start:.3f}:d=0.05",
-                            "-t",
-                            f"{target_duration:.3f}",
-                            "-vn",
-                            "-acodec",
-                            "pcm_s16le",
-                            "-ar",
-                            "24000",
-                            "-ac",
-                            "1",
-                            final_wav_path,
-                        ],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                    )
+                    # Clip is longer even after stretching: trim trailing silence if possible, but NEVER cut words
+                    trimmed_stretched_dur = _trim_trailing_silence(stretched_wav)
+                    if trimmed_stretched_dur <= target_duration:
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                stretched_wav,
+                                "-af",
+                                f"apad=whole_dur={target_duration:.3f}",
+                                "-vn",
+                                "-acodec",
+                                "pcm_s16le",
+                                "-ar",
+                                "24000",
+                                "-ac",
+                                "1",
+                                final_wav_path,
+                            ],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        status_note = f"atempo stretched ({clamped_factor:.2f}x) + trimmed trailing silence"
+                    else:
+                        shutil.copyfile(stretched_wav, final_wav_path)
+                        overflow = trimmed_stretched_dur - target_duration
+                        warn_msg = (
+                            f"[synthesize] Warning: Segment {idx + 1} will run long / overlap with next segment's start "
+                            f"(duration: {trimmed_stretched_dur:.2f}s exceeds target: {target_duration:.2f}s by {overflow:.2f}s). "
+                            f"Keeping full audio to prevent dropping words."
+                        )
+                        print(warn_msg, flush=True)
+                        status_note = f"atempo stretched ({clamped_factor:.2f}x) (runs long by {overflow:.2f}s)"
 
-                status_note = f"atempo stretched ({clamped_factor:.2f}x)"
-
-            adjusted_duration = _get_audio_duration(final_wav_path)
+            final_written_duration = _get_audio_duration(final_wav_path)
             segment["audio_path"] = os.path.abspath(final_wav_path)
 
             print(
                 f"[synthesize] Segment {idx + 1}/{total_segments} ({start:.2f}s - {end:.2f}s): "
-                f"target: {target_duration:.2f}s, generated: {actual_duration:.2f}s -> "
-                f"adjusted: {adjusted_duration:.2f}s [{status_note}]",
+                f"raw duration: {raw_duration:.2f}s vs. final written duration: {final_written_duration:.2f}s "
+                f"(target: {target_duration:.2f}s) [{status_note}]",
                 flush=True,
             )
 
